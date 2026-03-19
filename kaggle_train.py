@@ -28,7 +28,7 @@ import time
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
 from dcm_model import DCMConfig, DiffusionContextModel
@@ -158,7 +158,7 @@ def main():
     )
 
     # Mixed precision scaler (fp16 on T4)
-    scaler = GradScaler()
+    scaler = GradScaler("cuda")
 
     # ----- Training Loop -----
     print(f"\nStarting training...")
