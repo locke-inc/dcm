@@ -1,34 +1,34 @@
 """
 kaggle_train.py — DCM training loop for Kaggle dual-T4 GPUs
 ============================================================
-Uses HuggingFace Accelerate for DDP across 2x NVIDIA T4 (16GB each).
+Uses single-process model parallelism: Qwen is sharded across both T4s via
+device_map="auto", while the encoder/diffuser live on cuda:0.
+
+This is NOT DDP — both GPUs serve one model copy. The two T4s give us 32GB
+total VRAM, enough for 4-bit Qwen (7GB) + encoder (52M) + diffuser (32M)
++ activations + optimizer states.
 
 Key optimizations for T4 memory:
     - Qwen loaded in 4-bit NF4 quantization
-    - LoRA adapters (only ~0.5% of params trainable)
+    - LoRA adapters (only ~0.5% of Qwen params trainable)
     - Gradient accumulation to reach effective batch sizes
-    - Mixed precision (bf16/fp16) for all custom modules
-    - Gradient checkpointing on the SSM encoder
+    - Mixed precision (fp16) via torch.cuda.amp
+    - Gradient checkpointing on encoder
 
 Usage (Kaggle notebook):
-    !accelerate launch --num_processes=2 kaggle_train.py
-
-Or configure via accelerate config first:
-    !accelerate config  # select multi-GPU, 2 processes, bf16
-    !accelerate launch kaggle_train.py
+    !python kaggle_train.py --use_synthetic --max_steps 50 --log_every 5
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import time
-from pathlib import Path
 
 import torch
 import torch.nn as nn
-from accelerate import Accelerator
-from accelerate.utils import set_seed
+from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 
 from dcm_model import DCMConfig, DiffusionContextModel
@@ -51,9 +51,9 @@ def parse_args():
 
     # Training
     p.add_argument("--batch_size", type=int, default=1,
-                    help="Per-device micro batch size")
+                    help="Micro batch size")
     p.add_argument("--gradient_accumulation_steps", type=int, default=8,
-                    help="Accumulation steps (effective batch = batch_size * num_gpus * accum)")
+                    help="Accumulation steps (effective batch = batch_size * accum)")
     p.add_argument("--learning_rate", type=float, default=2e-4)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--max_steps", type=int, default=5000)
@@ -79,7 +79,7 @@ def get_lr(step: int, warmup: int, max_steps: int, peak_lr: float) -> float:
     if step < warmup:
         return peak_lr * step / max(warmup, 1)
     progress = (step - warmup) / max(max_steps - warmup, 1)
-    return peak_lr * 0.5 * (1.0 + __import__("math").cos(__import__("math").pi * progress))
+    return peak_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
 # ---------------------------------------------------------------------------
@@ -88,20 +88,18 @@ def get_lr(step: int, warmup: int, max_steps: int, peak_lr: float) -> float:
 
 def main():
     args = parse_args()
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
-    # Initialize Accelerator (handles DDP, mixed precision, device placement)
-    accelerator = Accelerator(
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision="bf16",  # T4 supports fp16; bf16 via software emulation
-        log_with="tensorboard",
-        project_dir=args.output_dir,
-    )
-    set_seed(args.seed)
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    device_name = torch.cuda.get_device_name(0) if num_gpus > 0 else "CPU"
 
-    accelerator.print("=" * 60)
-    accelerator.print("  DCM — Diffusion Context Model — Kaggle Training")
-    accelerator.print(f"  Devices: {accelerator.num_processes} x {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
-    accelerator.print("=" * 60)
+    print("=" * 60)
+    print("  DCM — Diffusion Context Model — Kaggle Training")
+    print(f"  GPUs: {num_gpus} x {device_name}")
+    print(f"  Mode: Model parallelism (Qwen sharded across all GPUs)")
+    print("=" * 60)
 
     # ----- Config -----
     cfg = DCMConfig(
@@ -111,32 +109,32 @@ def main():
     )
 
     # ----- Model -----
-    accelerator.print("Loading DCM model (4-bit Qwen + SSM encoder + diffuser)...")
+    # device_map="auto" shards Qwen across all available GPUs.
+    # Encoder and diffuser are placed on the same device as Qwen's first layer.
+    print("Loading DCM model (4-bit Qwen + SSM encoder + diffuser)...")
     model = DiffusionContextModel(cfg, device_map="auto")
 
-    # Freeze base Qwen (only LoRA + encoder + diffuser are trainable)
+    # Collect trainable params
     trainable_params = []
     for name, param in model.named_parameters():
         if param.requires_grad:
             trainable_params.append(param)
-            if accelerator.is_main_process:
-                accelerator.print(f"  Trainable: {name} | {param.numel():,} params")
 
     total_trainable = sum(p.numel() for p in trainable_params)
-    accelerator.print(f"Total trainable parameters: {total_trainable:,}")
+    print(f"Total trainable parameters: {total_trainable:,}")
 
     # ----- Data -----
     if args.use_synthetic:
-        accelerator.print("Using SYNTHETIC data for testing.")
+        print("Using SYNTHETIC data for testing.")
         vocab_size = model.decoder.tokenizer.vocab_size
         dataset = SyntheticLongTextDataset(
             vocab_size=vocab_size,
             context_len=args.context_len,
             continuation_len=args.continuation_len,
-            num_samples=args.max_steps * args.batch_size * args.gradient_accumulation_steps,
+            num_samples=args.max_steps * args.batch_size * args.gradient_accumulation_steps * 2,
         )
     else:
-        accelerator.print(f"Loading data from: {args.data_dir}")
+        print(f"Loading data from: {args.data_dir}")
         dataset = LongTextIterableDataset(
             data_dir=args.data_dir,
             tokenizer=model.decoder.tokenizer,
@@ -159,18 +157,19 @@ def main():
         betas=(0.9, 0.95),
     )
 
-    # ----- Prepare with Accelerate -----
-    # Note: We don't prepare the full model since Qwen uses device_map="auto".
-    # Instead, we prepare encoder + diffuser + optimizer + dataloader.
-    model.encoder, model.diffuser, optimizer, dataloader = accelerator.prepare(
-        model.encoder, model.diffuser, optimizer, dataloader
-    )
+    # Mixed precision scaler (fp16 on T4)
+    scaler = GradScaler()
 
     # ----- Training Loop -----
-    accelerator.print("\nStarting training...")
+    print(f"\nStarting training...")
+    print(f"  Batch size: {args.batch_size}")
+    print(f"  Gradient accumulation: {args.gradient_accumulation_steps}")
+    print(f"  Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
+    print(f"  Max steps: {args.max_steps}")
     os.makedirs(args.output_dir, exist_ok=True)
 
     global_step = 0
+    micro_step = 0
     running_loss = 0.0
     running_loss_ar = 0.0
     running_loss_diff = 0.0
@@ -187,58 +186,65 @@ def main():
             data_iter = iter(dataloader)
             batch = next(data_iter)
 
-        with accelerator.accumulate(model.encoder, model.diffuser):
-            # Move to device
-            context_ids = batch["context_ids"]
-            continuation_ids = batch["continuation_ids"]
-            continuation_labels = batch["continuation_labels"]
+        context_ids = batch["context_ids"]
+        continuation_ids = batch["continuation_ids"]
+        continuation_labels = batch["continuation_labels"]
 
-            # Forward pass
+        # Forward pass with mixed precision
+        with autocast(device_type="cuda", dtype=torch.float16):
             outputs = model(
                 context_ids=context_ids,
                 continuation_ids=continuation_ids,
                 continuation_labels=continuation_labels,
             )
+            loss = outputs["loss"] / args.gradient_accumulation_steps
 
-            loss = outputs["loss"]
+        # Backward with scaled gradients
+        scaler.scale(loss).backward()
 
-            # Backward
-            accelerator.backward(loss)
+        # Track metrics (use unscaled loss for logging)
+        running_loss += outputs["loss"].item()
+        running_loss_ar += outputs["loss_ar"].item()
+        running_loss_diff += outputs["loss_diffusion"].item()
 
+        micro_step += 1
+
+        # Optimizer step after accumulation
+        if micro_step % args.gradient_accumulation_steps == 0:
             # Gradient clipping
-            if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(trainable_params, max_norm=1.0)
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
 
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
 
             # LR scheduling
             lr = get_lr(global_step, args.warmup_steps, args.max_steps, args.learning_rate)
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
 
-            optimizer.zero_grad()
-
-        # Track metrics
-        running_loss += outputs["loss"].item()
-        running_loss_ar += outputs["loss_ar"].item()
-        running_loss_diff += outputs["loss_diffusion"].item()
-
-        if accelerator.sync_gradients:
             global_step += 1
 
             # Logging
-            if global_step % args.log_every == 0 and accelerator.is_main_process:
-                avg_loss = running_loss / args.log_every
-                avg_ar = running_loss_ar / args.log_every
-                avg_diff = running_loss_diff / args.log_every
+            if global_step % args.log_every == 0:
+                n = args.log_every * args.gradient_accumulation_steps
+                avg_loss = running_loss / n
+                avg_ar = running_loss_ar / n
+                avg_diff = running_loss_diff / n
                 elapsed = time.time() - start_time
                 steps_per_sec = global_step / elapsed
 
-                accelerator.print(
+                # GPU memory
+                mem_alloc = torch.cuda.memory_allocated(0) / 1024**3 if num_gpus > 0 else 0
+                mem_total = torch.cuda.get_device_properties(0).total_mem / 1024**3 if num_gpus > 0 else 0
+
+                print(
                     f"Step {global_step}/{args.max_steps} | "
                     f"Loss: {avg_loss:.4f} (AR: {avg_ar:.4f}, Diff: {avg_diff:.4f}) | "
                     f"LR: {lr:.2e} | "
-                    f"Speed: {steps_per_sec:.2f} steps/s"
+                    f"Speed: {steps_per_sec:.2f} steps/s | "
+                    f"GPU0: {mem_alloc:.1f}/{mem_total:.1f} GB"
                 )
                 running_loss = 0.0
                 running_loss_ar = 0.0
@@ -247,14 +253,32 @@ def main():
             # Checkpointing
             if global_step % args.save_every == 0:
                 save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                accelerator.print(f"Saving checkpoint to {save_path}")
-                accelerator.save_state(save_path)
+                print(f"Saving checkpoint to {save_path}")
+                os.makedirs(save_path, exist_ok=True)
+                # Save trainable components only (encoder, diffuser, LoRA, memory_proj)
+                torch.save({
+                    "global_step": global_step,
+                    "encoder": model.encoder.state_dict(),
+                    "diffuser": model.diffuser.state_dict(),
+                    "memory_proj": model.decoder.memory_proj.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scaler": scaler.state_dict(),
+                }, os.path.join(save_path, "dcm_training_state.pt"))
+                # Save LoRA adapter separately
+                model.decoder.model.save_pretrained(os.path.join(save_path, "lora_adapter"))
 
     # ----- Final save -----
-    accelerator.print("Training complete!")
+    print("Training complete!")
     final_path = os.path.join(args.output_dir, "checkpoint-final")
-    accelerator.save_state(final_path)
-    accelerator.print(f"Final checkpoint saved to {final_path}")
+    os.makedirs(final_path, exist_ok=True)
+    torch.save({
+        "global_step": global_step,
+        "encoder": model.encoder.state_dict(),
+        "diffuser": model.diffuser.state_dict(),
+        "memory_proj": model.decoder.memory_proj.state_dict(),
+    }, os.path.join(final_path, "dcm_training_state.pt"))
+    model.decoder.model.save_pretrained(os.path.join(final_path, "lora_adapter"))
+    print(f"Final checkpoint saved to {final_path}")
 
 
 if __name__ == "__main__":
