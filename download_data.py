@@ -32,20 +32,13 @@ def main():
 
     print(f"CSV has {len(rows)} rows. Columns: {list(rows[0].keys())}")
 
-    id_col = guess_id_column(rows[0])
-    if id_col is None:
-        print("ERROR: Could not find an ID column. Columns are:", list(rows[0].keys()))
-        print("First row:", rows[0])
-        return
-
-    print(f"Using column '{id_col}' as book ID")
-
     count = 0
     for row in rows:
         if count >= MAX_BOOKS:
             break
-        book_id = row[id_col].strip()
-        if not book_id:
+        link = row.get("Link", "")
+        book_id = link.rstrip("/").split("/")[-1]
+        if not book_id or not book_id.isdigit():
             continue
         url = f"https://www.gutenberg.org/cache/epub/{book_id}/pg{book_id}.txt"
         try:
