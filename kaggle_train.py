@@ -67,6 +67,13 @@ def parse_args():
     p.add_argument("--lora_r", type=int, default=16)
     p.add_argument("--seed", type=int, default=42)
 
+    # Fast POC overrides (shrink dimensions to validate concept on free T4s)
+    p.add_argument("--latent_dim", type=int, default=None,
+                    help="Override latent_dim (default=3584, try 512 for fast POC)")
+    p.add_argument("--num_latent_vectors", type=int, default=64)
+    p.add_argument("--denoiser_hidden_dim", type=int, default=None,
+                    help="Override denoiser hidden dim (default=1024, try 256 for fast POC)")
+
     return p.parse_args()
 
 
@@ -102,11 +109,16 @@ def main():
     print("=" * 60)
 
     # ----- Config -----
-    cfg = DCMConfig(
+    cfg_kwargs = dict(
         lambda_diffusion=args.lambda_diffusion,
         lora_r=args.lora_r,
-        num_latent_vectors=64,
+        num_latent_vectors=args.num_latent_vectors,
     )
+    if args.latent_dim is not None:
+        cfg_kwargs["latent_dim"] = args.latent_dim
+    if args.denoiser_hidden_dim is not None:
+        cfg_kwargs["denoiser_hidden_dim"] = args.denoiser_hidden_dim
+    cfg = DCMConfig(**cfg_kwargs)
 
     # ----- Model -----
     # device_map="auto" shards Qwen across all available GPUs.
