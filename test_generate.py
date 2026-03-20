@@ -75,6 +75,7 @@ def main():
         latent_dim=512,
         num_latent_vectors=16,
         denoiser_hidden_dim=256,
+        cond_dim=256,
     )
 
     print("Loading model...")
@@ -121,6 +122,7 @@ def main():
                 prompt_ids=prompt_ids,
                 max_new_tokens=80,
                 temperature=0.7,
+                diffusion_steps=50,
             )
 
         text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
@@ -138,6 +140,7 @@ def main():
             prompt_ids=prompt_ids,
             max_new_tokens=80,
             temperature=0.7,
+            diffusion_steps=50,
         )
 
     control_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)

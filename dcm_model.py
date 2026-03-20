@@ -52,6 +52,9 @@ class DCMConfig:
     lora_dropout: float = 0.05
     lora_target_modules: Tuple[str, ...] = ("q_proj", "v_proj")
 
+    # Conditioning (Path B: conditional diffusion)
+    cond_dim: int = 256                # Conditioning vector dimension (information bottleneck)
+
     # Training
     lambda_diffusion: float = 1.0      # Weight of L_diffuser_MSE in hybrid loss
 
@@ -135,11 +138,16 @@ class _SelectiveSSMBlock(nn.Module):
 
 class DCM_SSMEncoder(nn.Module):
     """
-    Encodes a variable-length token embedding sequence into a *fixed-length*
-    sequence of continuous latent vectors z₀ ∈ ℝ^{num_latent × latent_dim}.
+    Encodes a variable-length token embedding sequence into:
+        1. z₀ ∈ ℝ^{M × D}  — full latent memory (diffusion training target)
+        2. c  ∈ ℝ^{cond_dim} — small conditioning vector (information bottleneck)
+
+    The conditioning vector c is what the diffuser uses to reconstruct
+    context-specific memory from noise at inference time.
 
     Pipeline:
-        token_embeddings → [SSM blocks] → adaptive_pool → z₀
+        token_embeddings → [SSM blocks] → query_pool → z₀
+                                        → mean_pool → c
     """
 
     def __init__(self, cfg: DCMConfig):
@@ -162,12 +170,20 @@ class DCM_SSMEncoder(nn.Module):
         self.pool_proj_k = nn.Linear(cfg.latent_dim, cfg.latent_dim, bias=False)
         self.pool_proj_v = nn.Linear(cfg.latent_dim, cfg.latent_dim, bias=False)
 
-    def forward(self, token_embeddings: torch.Tensor) -> torch.Tensor:
+        # Conditioning head: mean-pool SSM output → small bottleneck vector
+        self.cond_proj = nn.Sequential(
+            nn.Linear(cfg.latent_dim, cfg.cond_dim),
+            nn.SiLU(),
+            nn.Linear(cfg.cond_dim, cfg.cond_dim),
+        )
+
+    def forward(self, token_embeddings: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             token_embeddings: (B, L, ssm_input_dim) from the base LLM's embedding layer
         Returns:
             z0: (B, num_latent_vectors, latent_dim) — the true latents
+            c:  (B, cond_dim) — conditioning vector for the diffuser
         """
         x = self.input_proj(token_embeddings)  # (B, L, latent_dim)
 
@@ -175,6 +191,9 @@ class DCM_SSMEncoder(nn.Module):
             x = block(x)  # (B, L, latent_dim)
 
         x = self.output_norm(x)
+
+        # Conditioning vector: mean-pool → project through bottleneck
+        c = self.cond_proj(x.mean(dim=1))  # (B, cond_dim)
 
         # Compress L → num_latent_vectors via learned query pooling
         keys = self.pool_proj_k(x)    # (B, L, D)
@@ -187,7 +206,7 @@ class DCM_SSMEncoder(nn.Module):
         attn = F.softmax(attn, dim=-1)
         z0 = torch.bmm(attn, values)  # (B, M, D)
 
-        return z0
+        return z0, c
 
 
 # ===========================================================================
@@ -214,11 +233,18 @@ class _SinusoidalTimeEmbedding(nn.Module):
 
 class _DenoisingMLP(nn.Module):
     """
-    Lightweight MLP denoiser with residual connections.
-    Predicts x₀ (the clean latent) from noisy input zₜ and timestep t.
+    Context-conditional MLP denoiser with AdaLN (Adaptive Layer Norm).
+
+    Predicts x₀ (the clean latent) from noisy input zₜ, timestep t,
+    and a conditioning vector c that carries context information.
+
+    AdaLN modulation (from DiT): the conditioning vector predicts per-layer
+    scale and shift parameters that modulate the LayerNorm output. This lets
+    the denoiser produce different z₀ predictions for different contexts.
     """
 
-    def __init__(self, latent_dim: int, hidden_dim: int, time_dim: int, num_layers: int):
+    def __init__(self, latent_dim: int, hidden_dim: int, time_dim: int,
+                 num_layers: int, cond_dim: int):
         super().__init__()
         self.time_embed = _SinusoidalTimeEmbedding(time_dim)
         self.time_proj = nn.Sequential(
@@ -227,8 +253,15 @@ class _DenoisingMLP(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # Input projection: concat(z_t, time) → hidden
-        self.input_proj = nn.Linear(latent_dim + hidden_dim, hidden_dim)
+        # Context conditioning projection
+        self.cond_proj = nn.Sequential(
+            nn.Linear(cond_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # Input projection: concat(z_t, time, cond) → hidden
+        self.input_proj = nn.Linear(latent_dim + hidden_dim * 2, hidden_dim)
 
         # Residual MLP blocks
         layers = []
@@ -240,17 +273,24 @@ class _DenoisingMLP(nn.Module):
         self.blocks = nn.ModuleList(layers)
         self.num_blocks = num_layers
 
+        # AdaLN: per-block scale and shift predicted from conditioning
+        self.adaLN_projs = nn.ModuleList([
+            nn.Linear(hidden_dim, hidden_dim * 2)
+            for _ in range(num_layers)
+        ])
+
         # Output projection back to latent_dim
         self.output_proj = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, latent_dim),
         )
 
-    def forward(self, z_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def forward(self, z_t: torch.Tensor, t: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         """
         Args:
             z_t: (B, M, latent_dim) — noisy latents
             t:   (B,) — integer timesteps
+            c:   (B, cond_dim) — context conditioning vector
         Returns:
             z0_pred: (B, M, latent_dim) — predicted clean latents (x₀-prediction)
         """
@@ -261,15 +301,24 @@ class _DenoisingMLP(nn.Module):
         t_emb = self.time_proj(t_emb)      # (B, hidden_dim)
         t_emb = t_emb.unsqueeze(1).expand(-1, M, -1)  # (B, M, hidden_dim)
 
-        # Concat noisy latents with time embedding
-        h = torch.cat([z_t, t_emb], dim=-1)  # (B, M, D + hidden_dim)
-        h = self.input_proj(h)                # (B, M, hidden_dim)
+        # Context conditioning
+        c_emb = self.cond_proj(c)          # (B, hidden_dim)
+        c_emb = c_emb.unsqueeze(1).expand(-1, M, -1)  # (B, M, hidden_dim)
 
-        # Residual blocks (each block = LayerNorm → Linear → SiLU → Linear)
+        # Concat noisy latents with time + context embeddings
+        h = torch.cat([z_t, t_emb, c_emb], dim=-1)  # (B, M, D + 2*hidden_dim)
+        h = self.input_proj(h)                        # (B, M, hidden_dim)
+
+        # Residual blocks with AdaLN modulation
         for i in range(self.num_blocks):
             base = i * 4
             residual = h
-            h = self.blocks[base](h)      # LayerNorm
+            h = self.blocks[base](h)      # LayerNorm (base normalization)
+
+            # AdaLN: conditioning predicts per-layer scale and shift
+            scale, shift = self.adaLN_projs[i](c_emb).chunk(2, dim=-1)
+            h = h * (1 + scale) + shift   # Modulate
+
             h = self.blocks[base + 1](h)  # Linear
             h = self.blocks[base + 2](h)  # SiLU
             h = self.blocks[base + 3](h)  # Linear
@@ -304,12 +353,13 @@ class DCM_LatentDiffuser(nn.Module):
             "sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod)
         )
 
-        # ----- Denoising network -----
+        # ----- Denoising network (context-conditioned) -----
         self.denoiser = _DenoisingMLP(
             latent_dim=cfg.latent_dim,
             hidden_dim=cfg.denoiser_hidden_dim,
             time_dim=cfg.time_embed_dim,
             num_layers=cfg.denoiser_num_layers,
+            cond_dim=cfg.cond_dim,
         )
 
     # ---- Forward diffusion (add noise) ----
@@ -339,13 +389,17 @@ class DCM_LatentDiffuser(nn.Module):
 
     # ---- Reverse diffusion (denoise) ----
 
-    def predict_z0(self, z_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """Predict clean latents ẑ₀ from noisy zₜ (x₀-prediction)."""
-        return self.denoiser(z_t, t)
+    def predict_z0(self, z_t: torch.Tensor, t: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """Predict clean latents ẑ₀ from noisy zₜ, conditioned on context c."""
+        return self.denoiser(z_t, t, c)
 
-    def diffusion_loss(self, z0: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def diffusion_loss(self, z0: torch.Tensor, c: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute the diffusion training loss (MSE between z₀ and ẑ₀).
+
+        Args:
+            z0: (B, M, D) clean latents from encoder
+            c:  (B, cond_dim) conditioning vector from encoder
 
         Returns:
             loss:    scalar MSE
@@ -355,16 +409,20 @@ class DCM_LatentDiffuser(nn.Module):
         t = torch.randint(0, self.cfg.diffusion_steps, (B,), device=z0.device)
 
         z_t, _ = self.q_sample(z0, t)
-        z0_pred = self.predict_z0(z_t, t)
+        z0_pred = self.predict_z0(z_t, t, c)
 
         loss = F.mse_loss(z0_pred, z0)
         return loss, z0_pred
 
     @torch.no_grad()
-    def sample(self, z_t: torch.Tensor, num_steps: int = 50) -> torch.Tensor:
+    def sample(self, z_t: torch.Tensor, c: torch.Tensor, num_steps: int = 50) -> torch.Tensor:
         """
-        Full reverse sampling (DDPM-style) for inference.
-        Uses a strided subset of the full schedule for speed.
+        Full reverse sampling (DDIM-style) for inference, conditioned on c.
+
+        Args:
+            z_t: (B, M, D) starting noise
+            c:   (B, cond_dim) conditioning vector from encoder
+            num_steps: number of denoising steps
         """
         step_indices = torch.linspace(
             self.cfg.diffusion_steps - 1, 0, num_steps, dtype=torch.long,
@@ -373,7 +431,7 @@ class DCM_LatentDiffuser(nn.Module):
 
         for i, t_val in enumerate(step_indices):
             t = t_val.expand(z_t.size(0))
-            z0_pred = self.predict_z0(z_t, t)
+            z0_pred = self.predict_z0(z_t, t, c)
 
             if i < len(step_indices) - 1:
                 # Move to the next (less noisy) step
@@ -610,7 +668,7 @@ class DiffusionContextModel(nn.Module):
         Returns:
             dict with keys: loss, loss_ar, loss_diffusion, logits
         """
-        # --- Step 1: Encode context → true latents z₀ ---
+        # --- Step 1: Encode context → latents z₀ + conditioning c ---
         device = self._device
         context_ids = context_ids.to(device)
         continuation_ids = continuation_ids.to(device)
@@ -618,10 +676,10 @@ class DiffusionContextModel(nn.Module):
 
         embed_layer = self.get_embedding_layer()
         context_embeds = embed_layer(context_ids)         # (B, L_ctx, H)
-        z0 = self.encoder(context_embeds)                  # (B, M, D)
+        z0, c = self.encoder(context_embeds)              # (B, M, D), (B, cond_dim)
 
-        # --- Step 2: Forward + reverse diffusion ---
-        loss_diff, z0_pred = self.diffuser.diffusion_loss(z0)  # scalar, (B, M, D)
+        # --- Step 2: Conditional diffusion (denoise z_t → z0_pred, conditioned on c) ---
+        loss_diff, z0_pred = self.diffuser.diffusion_loss(z0, c)  # scalar, (B, M, D)
 
         # --- Step 3: AR prediction conditioned on denoised memory ---
         logits, loss_ar = self.decoder.forward_with_memory(
@@ -647,26 +705,27 @@ class DiffusionContextModel(nn.Module):
         prompt_ids: torch.Tensor,
         max_new_tokens: int = 128,
         temperature: float = 0.7,
+        diffusion_steps: int = 50,
     ) -> torch.Tensor:
         """
-        Inference: encode context via SSM, use latents directly as memory
-        prefix, then autoregressively generate tokens.
+        Inference: encode context → conditioning vector c, then sample
+        context-specific memory from noise via conditional diffusion,
+        then autoregressively generate tokens.
         """
         self.eval()
         device = self._device
         context_ids = context_ids.to(device)
         prompt_ids = prompt_ids.to(device)
 
-        # Encode context
+        # Encode context → conditioning vector
         embed_layer = self.get_embedding_layer()
         context_embeds = embed_layer(context_ids)
-        z0 = self.encoder(context_embeds)
+        z0, c = self.encoder(context_embeds)
 
-        # Use encoder output directly as memory.
-        # The diffuser is an unconditional denoiser (no context conditioning),
-        # so sampling from pure noise discards all context information.
-        # The diffuser's role is training regularization, not inference sampling.
-        memory = z0
+        # Conditional diffusion: sample memory from noise, guided by c
+        B, M, D = z0.shape
+        z_t = torch.randn(B, M, D, device=device)
+        memory = self.diffuser.sample(z_t, c, num_steps=diffusion_steps)
 
         # Greedy / temperature sampling
         generated = prompt_ids

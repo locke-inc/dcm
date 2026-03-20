@@ -1,60 +1,66 @@
 # DCM — Diffusion Context Model
 
-Replaces the **O(n^2) KV-cache** of autoregressive Transformers with a **continuous, O(n)-scaling semantic memory** built on latent diffusion. Context tokens are compressed into a fixed-length sequence of continuous latent vectors via a State Space Model, refined through a denoising diffusion process, then injected as soft prompts into a frozen LLM.
+Replaces the **O(n^2) KV-cache** of autoregressive Transformers with a **continuous, O(n)-scaling semantic memory**. Context tokens are compressed into a fixed-length sequence of continuous latent vectors via a State Space Model, then injected as soft prompts into a frozen LLM. A diffusion process regularizes the latent space during training.
 
 ---
 
 ## Architecture
 
 ```
-                         DCM — Full Pipeline
-  ═══════════════════════════════════════════════════════════
+                    DCM — Full Pipeline (Path B: Conditional Diffusion)
+  ══════════════════════════════════════════════════════════════════════
 
-  CONTEXT TOKENS (B, L_ctx)          CONTINUATION TOKENS (B, L_cont)
-        │                                      │
-        ▼                                      │
-  ┌───────────────┐                            │
-  │  Qwen Embed   │  (shared embedding layer)  │
-  │  Layer (frozen)│                            │
-  └──────┬────────┘                            │
-         │ (B, L_ctx, 3584)                    │
-         ▼                                     │
-  ┌─────────────────────────────┐              │
-  │      DCM_SSMEncoder         │              │
-  │  ┌────────────────────────┐ │              │
-  │  │  Linear Projection     │ │              │
-  │  │  D_in → D_latent       │ │              │
-  │  └──────────┬─────────────┘ │              │
-  │             ▼               │              │
-  │  ┌────────────────────────┐ │              │
-  │  │  SSM Block x2          │ │              │
-  │  │  (Selective Scan,      │ │              │
-  │  │   O(n) recurrence)     │ │              │
-  │  └──────────┬─────────────┘ │              │
-  │             ▼               │              │
-  │  ┌────────────────────────┐ │              │
-  │  │  Learned Query Pooling │ │              │
-  │  │  L tokens → M latents  │ │              │
-  │  │  (1024 → 64 vectors)   │ │              │
-  │  └──────────┬─────────────┘ │              │
-  └─────────────┼───────────────┘              │
-                │ z0 (B, M, D)                 │
-                ▼                              │
-  ┌─────────────────────────────┐              │
-  │     DCM_LatentDiffuser      │              │
-  │                             │              │
-  │  TRAIN:                     │              │
-  │   z0 ──noise──► z_t         │              │
-  │   z_t ─denoise─► z0_pred    │              │
-  │   loss = MSE(z0, z0_pred)   │              │
-  │                             │              │
-  │  INFERENCE:                 │              │
-  │   noise ──sample──► z0_pred │              │
-  │   (50-step reverse DDIM)    │              │
-  └─────────────┬───────────────┘              │
-                │ z0_pred (B, M, D)            │
-                │ "denoised memory"            │
-                ▼                              ▼
+  CONTEXT TOKENS (B, L_ctx)             CONTINUATION TOKENS (B, L_cont)
+        │                                         │
+        ▼                                         │
+  ┌───────────────┐                               │
+  │  Qwen Embed   │  (shared embedding layer)     │
+  │  Layer (frozen)│                               │
+  └──────┬────────┘                               │
+         │ (B, L_ctx, D)                          │
+         ▼                                        │
+  ┌─────────────────────────────────────┐         │
+  │         DCM_SSMEncoder              │         │
+  │  ┌────────────────────────┐         │         │
+  │  │  Linear Projection     │         │         │
+  │  │  D_in → D_latent       │         │         │
+  │  └──────────┬─────────────┘         │         │
+  │             ▼                       │         │
+  │  ┌────────────────────────┐         │         │
+  │  │  SSM Block x2          │         │         │
+  │  │  (Selective Scan,      │         │         │
+  │  │   O(n) recurrence)     │         │         │
+  │  └──────────┬─────────────┘         │         │
+  │             │                       │         │
+  │       ┌─────┴─────┐                │         │
+  │       ▼           ▼                │         │
+  │  ┌──────────┐ ┌──────────────┐     │         │
+  │  │  Query   │ │  Mean Pool   │     │         │
+  │  │  Pooling │ │  → cond_proj │     │         │
+  │  │  L → M   │ │  L → 1       │     │         │
+  │  └────┬─────┘ └──────┬───────┘     │         │
+  │       │              │             │         │
+  └───────┼──────────────┼─────────────┘         │
+          │              │                       │
+     z0 (B,M,D)    c (B, cond_dim)              │
+     [train target]  [bottleneck]                │
+          │              │                       │
+          ▼              ▼                       │
+  ┌─────────────────────────────────┐            │
+  │     DCM_LatentDiffuser          │            │
+  │                                 │            │
+  │  TRAIN:                         │            │
+  │   z0 ──noise──► z_t             │            │
+  │   denoiser(z_t, t, c) → z0_pred│            │
+  │   loss = MSE(z0, z0_pred)      │            │
+  │                                 │            │
+  │  INFERENCE:                     │            │
+  │   noise + c ──sample──► z0_pred │            │
+  │   (50-step conditional DDIM)    │            │
+  └─────────────┬───────────────────┘            │
+                │ z0_pred (B, M, D)              │
+                │ "context-conditioned memory"   │
+                ▼                                ▼
   ┌───────────────────────────────────────────────────┐
   │              QwenLoRAHead                         │
   │                                                   │
@@ -83,13 +89,24 @@ Replaces the **O(n^2) KV-cache** of autoregressive Transformers with a **continu
   └─────────────────────────────┘
 ```
 
+### What each component does
+
+| Component | Role | Training | Inference |
+|-----------|------|----------|-----------|
+| **SSM Encoder** | Compresses L context tokens into z0 (M latent vectors) + c (small conditioning vector) in O(n). | Produces z0 (target) + c (conditioning) | Produces c (conditioning for diffuser) |
+| **Diffuser** | Context-conditioned denoiser with AdaLN. Learns to reconstruct z0 from noise given only the small conditioning vector c. | z0 + noise → z_t, denoiser(z_t, t, c) → z0_pred | noise + c → sample → z0_pred (context-specific memory) |
+| **Information bottleneck** | c (cond_dim=256) is much smaller than z0 (M×D). Forces encoder to compress the *essence* of context into c; diffuser expands it back into rich memory. | Gradient from both L_AR and L_diff shapes c | c is all the diffuser needs to reconstruct memory |
+| **LoRA + memory_proj** | Teaches Qwen to attend to the injected memory prefix vectors. | Trained | Used |
+| **Prefix injection** | Prepends memory as soft prompts to token embeddings before Qwen's forward pass. | Used | Used |
+
 ### Key Design Choices
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| Memory injection | **Option A: Prefix-tuning** (soft prompts prepended to embeddings) | No architectural surgery on Qwen; works with any decoder-only LLM |
+| Memory injection | **Prefix-tuning** (soft prompts prepended to embeddings) | No architectural surgery on Qwen; works with any decoder-only LLM |
 | Context encoder | **Selective SSM** (Mamba-style linear recurrence) | O(n) scaling, no self-attention quadratic cost |
-| Diffusion target | **x0-prediction** (predict clean latents directly) | More stable gradients than epsilon-prediction for this use case |
+| Diffusion conditioning | **AdaLN** (Adaptive Layer Norm, from DiT) | Per-layer scale/shift from c modulates denoiser — lightweight, proven in image diffusion |
+| Information bottleneck | **c ∈ ℝ^{cond_dim}** (small conditioning vector) | Forces encoder to learn what's essential; diffuser expands c back into M-vector memory |
 | Quantization | **4-bit NF4** via bitsandbytes | Required to fit Qwen 7B on T4 16GB GPUs |
 | Fine-tuning | **LoRA** on q_proj, v_proj | 0.03% trainable params; teaches Qwen to read injected memory |
 
@@ -155,19 +172,19 @@ import sys; sys.path.insert(0, "/kaggle/working/dcm")
 %cd /kaggle/working/dcm
 !python sanity_check.py --skip_qwen
 
-# Cell 4 — Proof-of-concept training (~15 min on 2x T4)
+# Cell 4 — Proof-of-concept training (~50 min on 2x T4)
 !python kaggle_train.py \
     --data_dir /kaggle/working/gutenberg_texts/ \
-    --max_steps 300 \
-    --log_every 25 \
+    --max_steps 1000 \
+    --log_every 50 \
     --context_len 128 \
     --continuation_len 128 \
     --latent_dim 512 \
     --num_latent_vectors 16 \
     --denoiser_hidden_dim 256 \
     --gradient_accumulation_steps 2 \
-    --warmup_steps 15 \
-    --learning_rate 2e-4
+    --warmup_steps 50 \
+    --learning_rate 3e-4
 
 # Cell 5 — Test generation (same prompt, different contexts)
 !python /kaggle/working/dcm/test_generate.py
@@ -251,11 +268,19 @@ L_total = L_AR + lambda * L_diffusion
 
 L_AR        = CrossEntropy(logits, next_token_labels)
               Only computed over continuation positions (memory prefix masked with -100)
+              Gradient flows: Qwen LoRA ← memory_proj ← z0_pred ← diffuser ← encoder
+              This is the primary signal that teaches the encoder what to compress.
 
 L_diffusion = MSE(z0, z0_pred)
               z0 = true latents from encoder
               z0_pred = denoiser output from noisy z_t at random timestep
+              Regularizes the latent space — forces encoder to produce representations
+              that survive noise corruption and can be reconstructed by the denoiser.
 ```
+
+Both losses train the encoder jointly. L_AR teaches it *what information to preserve*
+(whatever helps Qwen predict the next token). L_diffusion teaches it *how to structure
+the latent space* (smooth, denoising-friendly representations).
 
 ---
 

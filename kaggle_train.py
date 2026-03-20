@@ -73,6 +73,8 @@ def parse_args():
     p.add_argument("--num_latent_vectors", type=int, default=64)
     p.add_argument("--denoiser_hidden_dim", type=int, default=None,
                     help="Override denoiser hidden dim (default=1024, try 256 for fast POC)")
+    p.add_argument("--cond_dim", type=int, default=None,
+                    help="Override conditioning vector dim (default=256)")
 
     return p.parse_args()
 
@@ -118,6 +120,8 @@ def main():
         cfg_kwargs["latent_dim"] = args.latent_dim
     if args.denoiser_hidden_dim is not None:
         cfg_kwargs["denoiser_hidden_dim"] = args.denoiser_hidden_dim
+    if args.cond_dim is not None:
+        cfg_kwargs["cond_dim"] = args.cond_dim
     cfg = DCMConfig(**cfg_kwargs)
 
     # ----- Model -----
