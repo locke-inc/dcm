@@ -649,8 +649,8 @@ class DiffusionContextModel(nn.Module):
         temperature: float = 0.7,
     ) -> torch.Tensor:
         """
-        Inference: encode context, denoise memory from pure noise, then
-        autoregressively generate tokens.
+        Inference: encode context via SSM, use latents directly as memory
+        prefix, then autoregressively generate tokens.
         """
         self.eval()
         device = self._device
