@@ -249,7 +249,7 @@ def main():
 
                 # GPU memory
                 mem_alloc = torch.cuda.memory_allocated(0) / 1024**3 if num_gpus > 0 else 0
-                mem_total = torch.cuda.get_device_properties(0).total_mem / 1024**3 if num_gpus > 0 else 0
+                mem_total = torch.cuda.get_device_properties(0).total_memory / 1024**3 if num_gpus > 0 else 0
 
                 print(
                     f"Step {global_step}/{args.max_steps} | "
