@@ -127,6 +127,8 @@ dcm/
 │   ├── test_full_pipeline_with_qwen()  — End-to-end: 100 tokens → probability dist
 │   └── test_memory_report()            — GPU memory usage
 │
+├── download_data.py      # Fetches Gutenberg books from Kaggle metadata CSV
+├── test_generate.py      # Generation test: same prompt, different contexts
 ├── kaggle_notebook.py    # Copy-paste cells for Kaggle (103 lines)
 ├── aws_scaling_plan.md   # Phase 2: p4d.24xlarge scaling guide
 ├── requirements.txt      # Python dependencies
@@ -138,29 +140,65 @@ dcm/
 ## Quick Start (Kaggle)
 
 **Prerequisites:** Kaggle notebook with **GPU T4 x2** and **Internet** enabled.
+Add the dataset **mateibejan/15000-gutenberg-books** to your notebook.
 
 ```python
 # Cell 1 — Install + clone
-!pip install -q transformers accelerate peft bitsandbytes
+!pip install -q transformers accelerate peft bitsandbytes requests
 !git clone https://github.com/locke-inc/dcm.git /kaggle/working/dcm
 import sys; sys.path.insert(0, "/kaggle/working/dcm")
 
-# Cell 2 — Sanity check (no model download)
+# Cell 2 — Download training data (20 Gutenberg books)
+!python /kaggle/working/dcm/download_data.py
+
+# Cell 3 — Sanity check (no model download)
 %cd /kaggle/working/dcm
 !python sanity_check.py --skip_qwen
 
-# Cell 3 — Full sanity check (downloads Qwen ~15GB)
-!python sanity_check.py
+# Cell 4 — Proof-of-concept training (~15 min on 2x T4)
+!python kaggle_train.py \
+    --data_dir /kaggle/working/gutenberg_texts/ \
+    --max_steps 300 \
+    --log_every 25 \
+    --context_len 128 \
+    --continuation_len 128 \
+    --latent_dim 512 \
+    --num_latent_vectors 16 \
+    --denoiser_hidden_dim 256 \
+    --gradient_accumulation_steps 2 \
+    --warmup_steps 15 \
+    --learning_rate 2e-4
 
-# Cell 4 — Test training loop (synthetic data)
-!python kaggle_train.py --use_synthetic --max_steps 50 --log_every 5
-
-# Cell 5 — Real training with DDP
-!accelerate launch kaggle_train.py \
-    --data_dir /kaggle/input/YOUR_DATASET/ \
-    --batch_size 1 --gradient_accumulation_steps 8 \
-    --max_steps 5000 --output_dir /kaggle/working/dcm_checkpoints
+# Cell 5 — Test generation (same prompt, different contexts)
+!python /kaggle/working/dcm/test_generate.py
 ```
+
+### Fast POC vs Full-Scale Config
+
+The POC config shrinks dimensions to validate the concept on free T4s:
+
+| Parameter | Full Scale | POC | Why |
+|-----------|-----------|-----|-----|
+| `context_len` | 1024 | 128 | SSM scan is O(n) sequential loop — 8x fewer iterations |
+| `latent_dim` | 3584 | 512 | Each SSM step + diffuser ops ~7x cheaper |
+| `continuation_len` | 512 | 128 | Qwen processes 144 vs 576 positions |
+| `num_latent_vectors` | 64 | 16 | Smaller prefix + diffusion target |
+| `gradient_accumulation_steps` | 8 | 2 | 4x fewer forward passes per optimizer step |
+
+Full-scale training requires the Phase 2 AWS setup (see below), primarily because
+the SSM scan at `dcm_model.py:126` is a Python `for` loop that needs a Triton
+parallel scan kernel to run efficiently at `context_len=1024+`.
+
+### Evaluating the Generation Test
+
+`test_generate.py` feeds the **same generic prompt** through four wildly different contexts
+(alien veterinarian, medieval bakery, sentient AI, underwater city) plus a no-context control.
+
+| Result | Meaning |
+|--------|---------|
+| **STRONG PASS** | Each output references its specific context theme (aliens, herbs, code, water) |
+| **WEAK PASS** | Outputs differ from each other and from the control, but themes are vague |
+| **FAIL** | All outputs are basically the same generic text regardless of context |
 
 See `kaggle_notebook.py` for full cell-by-cell instructions including accelerate config.
 
