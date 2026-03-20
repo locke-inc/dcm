@@ -121,7 +121,6 @@ def main():
                 prompt_ids=prompt_ids,
                 max_new_tokens=80,
                 temperature=0.7,
-                diffusion_steps=50,
             )
 
         text = tokenizer.decode(output_ids[0], skip_special_tokens=True)

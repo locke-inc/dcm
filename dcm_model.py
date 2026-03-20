@@ -647,7 +647,6 @@ class DiffusionContextModel(nn.Module):
         prompt_ids: torch.Tensor,
         max_new_tokens: int = 128,
         temperature: float = 0.7,
-        diffusion_steps: int = 50,
     ) -> torch.Tensor:
         """
         Inference: encode context, denoise memory from pure noise, then
@@ -663,10 +662,11 @@ class DiffusionContextModel(nn.Module):
         context_embeds = embed_layer(context_ids)
         z0 = self.encoder(context_embeds)
 
-        # Full reverse diffusion from pure noise
-        B, M, D = z0.shape
-        z_t = torch.randn_like(z0)
-        memory = self.diffuser.sample(z_t, num_steps=diffusion_steps)
+        # Use encoder output directly as memory.
+        # The diffuser is an unconditional denoiser (no context conditioning),
+        # so sampling from pure noise discards all context information.
+        # The diffuser's role is training regularization, not inference sampling.
+        memory = z0
 
         # Greedy / temperature sampling
         generated = prompt_ids
